@@ -22,6 +22,7 @@ import securityBasics from './topics/security-basics.json'
 import loggingObservability from './topics/logging-observability.json'
 import systemDesign from './topics/system-design.json'
 import aiForEngineers from './topics/ai-for-engineers.json'
+import javaHeapSpace from './topics/java-heap-space.json'
 
 export const topics: Topic[] = [
   javaCore,
@@ -31,6 +32,7 @@ export const topics: Topic[] = [
   jvmInternals,
   generics,
   javadoc,
+  javaHeapSpace,
   oop,
   solid,
   cleanCode,

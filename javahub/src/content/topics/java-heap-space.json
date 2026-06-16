@@ -1,0 +1,164 @@
+{
+  "id": "java-heap-space",
+  "title": "Java Heap Space",
+  "group": "Java Core",
+  "estimatedMinutes": 90,
+  "subtopics": [
+    {
+      "id": "heap-anatomy",
+      "title": "Heap Anatomy & Memory Regions",
+      "cards": [
+        {
+          "id": "heap-anatomy-regions",
+          "topicId": "java-heap-space",
+          "subtopicId": "heap-anatomy",
+          "title": "Heap Regions: Young, Old & Metaspace",
+          "difficulty": "Beginner",
+          "explanation": "The JVM heap is split into regions with different lifetimes. The Young Generation (Eden + two Survivor spaces S0/S1) holds newly allocated objects; most die here in a Minor GC. Objects surviving several Minor GCs are promoted to the Old Generation (Tenured), where Major/Full GC runs less frequently but takes longer. Metaspace (Java 8+, replacing PermGen) is outside the heap and stores class metadata — it grows dynamically from native memory. The Code Cache stores JIT-compiled bytecode.",
+          "codeExample": "// Visualising the regions with flags:\n// -Xms512m           initial heap size\n// -Xmx2g             max heap size\n// -Xmn256m           young generation size (or -XX:NewRatio=3 → Old:Young = 3:1)\n// -XX:SurvivorRatio=8 → Eden:Survivor = 8:1:1\n// -XX:MaxMetaspaceSize=256m\n\n// Print heap region sizes at startup:\n// -XX:+PrintFlagsFinal | grep -E 'HeapSize|NewSize|MetaspaceSize'\n\n// Runtime query:\nRuntime rt = Runtime.getRuntime();\nlong usedMB = (rt.totalMemory() - rt.freeMemory()) / 1_048_576;\nlong maxMB  = rt.maxMemory() / 1_048_576;\nSystem.out.printf(\"Used: %d MB / Max: %d MB%n\", usedMB, maxMB);",
+          "whyItMatters": "Sizing regions correctly is the first lever for GC tuning. Undersized young gen causes frequent Minor GCs and early promotion; oversized old gen causes long Full GC pauses. Wrong Metaspace cap causes OOM during deployments with heavy class generation (Spring, CGLIB, Groovy).",
+          "gotcha": "Setting -Xms == -Xmx eliminates heap resize pauses (good for servers) but also prevents the JVM from releasing memory back to the OS after traffic spikes. In Kubernetes this keeps RSS high even when idle."
+        },
+        {
+          "id": "heap-anatomy-object-lifecycle",
+          "topicId": "java-heap-space",
+          "subtopicId": "heap-anatomy",
+          "title": "Object Lifecycle & Promotion",
+          "difficulty": "Beginner",
+          "explanation": "New objects are allocated in Eden (TLAB — Thread-Local Allocation Buffer — makes this near-zero cost). When Eden fills, a Minor GC copies live objects to a Survivor space; objects that survive -XX:MaxTenuringThreshold (default 15) Minor GCs are promoted to Old Gen. Large objects (-XX:PretenureSizeThreshold) bypass Eden and go directly to Old Gen to avoid copying overhead.",
+          "codeExample": "// Check tenuring threshold in use:\n// -XX:+PrintTenuringDistribution (Java < 17)\n// -Xlog:gc+age=debug  (Java 17+)\n\n// Example log output:\n// Desired survivor size 26214400 bytes, new threshold 7 (max: 15)\n// - age 1: 4048 bytes\n// - age 3: 24123456 bytes   ← bulk of survivors\n// - age 7: 1024 bytes       ← being promoted next GC\n\n// Force immediate promotion for known large objects:\n// -XX:PretenureSizeThreshold=512k\n// Objects >= 512 KB allocate directly in Old Gen",
+          "whyItMatters": "Premature promotion (objects moved to Old Gen too soon due to small Survivor spaces) is a silent GC killer — it fills Old Gen fast and triggers expensive Full GCs. Monitoring tenuring distribution reveals this.",
+          "gotcha": "TLABs are sized dynamically per thread. High-thread-count apps may see TLAB waste (unused portions at the end of each TLAB). Use -XX:TLABSize or -XX:-ResizeTLAB to tune if allocation profiling shows it."
+        },
+        {
+          "id": "heap-anatomy-oom-types",
+          "topicId": "java-heap-space",
+          "subtopicId": "heap-anatomy",
+          "title": "OutOfMemoryError Types & Diagnosis",
+          "difficulty": "Mid",
+          "explanation": "OOM errors are typed by the JVM and each points to a different root cause. 'Java heap space' means heap is exhausted — either a leak or undersized max heap. 'GC overhead limit exceeded' (default: >98% of time in GC recovering <2% heap) means the heap is live but fragmented or near capacity. 'Metaspace' means class metadata is uncapped or there's a classloader leak. 'Direct buffer memory' means off-heap NIO buffers exceed -XX:MaxDirectMemorySize. 'unable to create new native thread' is an OS-level thread/memory limit, not the JVM heap.",
+          "codeExample": "// 1. Heap OOM — enable heap dump on crash:\n// -XX:+HeapDumpOnOutOfMemoryError\n// -XX:HeapDumpPath=/tmp/heap.hprof\n\n// 2. GC overhead limit (can disable, but only to buy time):\n// -XX:-UseGCOverheadLimit   ← not recommended in production\n\n// 3. Metaspace — diagnose classloader leak:\njava.lang.management.MemoryMXBean mem =\n    ManagementFactory.getMemoryMXBean();\nMemoryUsage heap    = mem.getHeapMemoryUsage();\nMemoryUsage nonHeap = mem.getNonHeapMemoryUsage();\nSystem.out.println(\"Metaspace used: \" + nonHeap.getUsed() / 1024 / 1024 + \" MB\");\n\n// 4. Check direct buffer usage:\nBufferPoolMXBean direct = ManagementFactory\n    .getPlatformMXBeans(BufferPoolMXBean.class)\n    .stream().filter(b -> b.getName().equals(\"direct\"))\n    .findFirst().orElseThrow();\nSystem.out.println(\"Direct: \" + direct.getMemoryUsed() / 1024 / 1024 + \" MB\");",
+          "whyItMatters": "Reading the OOM message precisely saves hours. Engineers who immediately increase -Xmx on a 'GC overhead limit exceeded' error just defer the problem — the real fix is finding what objects are accumulating.",
+          "gotcha": "'Java heap space' during deserialization often means you're deserializing untrusted data with unbounded object graphs — both a memory and security issue (billion laughs attack). Validate payload size at the boundary."
+        }
+      ]
+    },
+    {
+      "id": "gc-algorithms",
+      "title": "Garbage Collection Algorithms",
+      "cards": [
+        {
+          "id": "gc-algorithms-overview",
+          "topicId": "java-heap-space",
+          "subtopicId": "gc-algorithms",
+          "title": "GC Algorithm Comparison: G1, ZGC, Shenandoah, Parallel",
+          "difficulty": "Mid",
+          "explanation": "Java ships four production GCs. Parallel GC (Java 8 default) maximises throughput with stop-the-world pauses — ideal for batch jobs. G1 GC (Java 9+ default) targets predictable pause times under 200ms using region-based collection; good for most server workloads. ZGC (Java 15 GA) achieves sub-millisecond pauses by doing most work concurrently; suited for latency-sensitive services with large heaps (up to 16TB). Shenandoah (Red Hat, Java 15) is similar to ZGC — concurrent compaction with very low pauses.",
+          "codeExample": "// Select GC algorithm:\n// -XX:+UseParallelGC        Parallel (throughput)\n// -XX:+UseG1GC              G1 (balanced — Java 9+ default)\n// -XX:+UseZGC               ZGC (sub-ms pauses, Java 15+)\n// -XX:+UseShenandoahGC      Shenandoah\n// -XX:+UseSerialGC          Serial (single-threaded, tiny heaps)\n\n// G1 pause target:\n// -XX:MaxGCPauseMillis=100  (soft target, not a guarantee)\n\n// ZGC with generational mode (Java 21+, much better throughput):\n// -XX:+UseZGC -XX:+ZGenerational\n\n// Print GC algorithm in use:\n// -Xlog:gc*=info:file=gc.log:time,uptime:filecount=5,filesize=20m",
+          "whyItMatters": "Choosing the wrong GC for your latency/throughput requirements is a common cause of SLA violations. A 4-second Full GC pause from Parallel GC on a 10GB heap will trigger circuit breakers in microservices — ZGC or G1 would keep pauses under 50ms on the same hardware.",
+          "gotcha": "G1's pause targets are soft. Under sustained allocation pressure (>80% heap utilisation) G1 falls back to a stop-the-world Full GC to avoid OOM. Design your heap so steady-state utilisation stays below 70%."
+        },
+        {
+          "id": "gc-algorithms-g1-deep",
+          "topicId": "java-heap-space",
+          "subtopicId": "gc-algorithms",
+          "title": "G1 GC Internals: Regions, Mixed GC & Humongous Objects",
+          "difficulty": "Senior",
+          "explanation": "G1 divides the heap into equal-sized regions (1–32 MB, auto-selected based on heap size). Eden, Survivor, and Old regions are not contiguous — G1 picks which regions to collect based on predicted pause time (Garbage First = collect most garbage first). A Mixed GC collects all Young + a subset of Old regions — this is how G1 reclaims old-generation space incrementally without Full GC. Objects larger than 50% of a region go into Humongous regions and are treated specially — they bypass Young Gen entirely and can cause fragmentation.",
+          "codeExample": "// Tune G1 region size (normally auto):\n// -XX:G1HeapRegionSize=16m\n\n// Humongous threshold is always 50% of region size.\n// With 16MB regions, objects >= 8MB are Humongous.\n// Avoid frequent large allocations — they fragment the heap.\n\n// Adjust how many Old regions are collected in Mixed GC:\n// -XX:G1MixedGCCountTarget=8    (spread Old reclaim over 8 cycles)\n// -XX:G1HeapWastePercent=5      (stop Mixed GC when < 5% reclaimable)\n\n// If you see 'to-space exhausted' in GC log:\n// → Young Gen is too full to absorb survivors\n// → Increase heap or reduce -XX:G1NewSizePercent\n\n// G1 GC log interpretation (Java 17+):\n// [gc] GC(42) Pause Young (Normal) (G1 Evacuation Pause) 512M->480M(2048M) 45.123ms\n//              ↑ trigger             ↑ type               before→after(max)  pause time",
+          "whyItMatters": "G1 is the default GC in all modern Java versions. Understanding regions and Mixed GC explains why you see 'pause Young' and 'pause Mixed' in logs, and why Full GC (evacuation failure) indicates heap pressure rather than a GC bug.",
+          "gotcha": "G1 Humongous allocations bypass TLAB and take a global lock. A spike in large byte[] allocations (e.g. reading large files into memory) can cause surprising latency spikes even with low heap utilisation."
+        },
+        {
+          "id": "gc-algorithms-zgc",
+          "topicId": "java-heap-space",
+          "subtopicId": "gc-algorithms",
+          "title": "ZGC: Concurrent Marking, Load Barriers & Colored Pointers",
+          "difficulty": "Senior",
+          "explanation": "ZGC achieves sub-millisecond pauses by doing marking, relocation, and compaction concurrently with application threads. It uses colored pointers (metadata bits in the 64-bit pointer itself) to track GC state per object reference, and load barriers (code injected at every heap read) to intercept and fix stale references at read time. Java 21 added Generational ZGC (-XX:+ZGenerational) which adds a Young/Old split for much better throughput without sacrificing low latency.",
+          "codeExample": "// Enable ZGC (Java 15 GA):\n// -XX:+UseZGC\n\n// Enable Generational ZGC (Java 21, highly recommended):\n// -XX:+UseZGC -XX:+ZGenerational\n\n// ZGC has no fixed pause target flag — pauses are inherently low.\n// Tune max heap generously; ZGC needs headroom to relocate concurrently:\n// -Xmx4g   (ZGC works best with >= 2x the live data set)\n\n// ZGC does NOT compact the heap during STW — it relocates objects\n// concurrently. This means:\n// ✓ Pause = mark start + mark end + relocate start (~< 1ms each)\n// ✗ Higher CPU overhead than G1 (~15-20% throughput cost)\n\n// Monitor ZGC:\n// -Xlog:gc*:file=zgc.log\n// Look for: [gc] GC(5) Garbage Collection (Proactive) 1200M(29%)->800M(19%)\n\n// Heap headroom rule of thumb:\n// Live set = 1GB → use -Xmx3g minimum for ZGC",
+          "whyItMatters": "For latency-critical services (trading, real-time APIs, gaming) ZGC is transformative — it eliminates the multi-second GC pauses that Parallel or even G1 can produce on large heaps. Java 21 Generational ZGC makes the throughput cost negligible for most workloads.",
+          "gotcha": "ZGC's load barriers add overhead to every heap read. CPU-bound code that reads many object fields in tight loops may show 10–20% throughput regression compared to G1. Profile before switching blindly."
+        }
+      ]
+    },
+    {
+      "id": "heap-tuning",
+      "title": "Heap Tuning & JVM Flags",
+      "cards": [
+        {
+          "id": "heap-tuning-flags",
+          "topicId": "java-heap-space",
+          "subtopicId": "heap-tuning",
+          "title": "Essential JVM Heap Flags for Production",
+          "difficulty": "Mid",
+          "explanation": "A minimal production JVM flag set covers heap sizing, GC algorithm selection, GC logging, OOM protection, and container awareness. These flags apply to Java 17+ (unified logging replaces deprecated -XX:+PrintGC flags).",
+          "codeExample": "# Minimal production flags (Java 17+, containerised service):\njava \\\n  -Xms1g -Xmx1g \\\n  -XX:+UseG1GC \\\n  -XX:MaxGCPauseMillis=100 \\\n  -XX:+UseContainerSupport \\\n  -XX:MaxRAMPercentage=75.0 \\\n  -XX:+HeapDumpOnOutOfMemoryError \\\n  -XX:HeapDumpPath=/var/log/heapdumps/ \\\n  -XX:+ExitOnOutOfMemoryError \\\n  -Xlog:gc*:file=/var/log/gc.log:time,uptime:filecount=5,filesize=20m \\\n  -jar app.jar\n\n# Key flag explanations:\n# -XX:+UseContainerSupport     read cgroup limits, not host RAM\n# -XX:MaxRAMPercentage=75.0    use 75% of container limit as -Xmx\n# -XX:+ExitOnOutOfMemoryError  fail fast; let orchestrator restart\n# filecount=5,filesize=20m     rolling GC logs, won't fill disk\n\n# For Java 21 with Generational ZGC:\n# Replace -XX:+UseG1GC with: -XX:+UseZGC -XX:+ZGenerational",
+          "whyItMatters": "The default JVM flags are designed for desktop apps, not containerised servers. Without UseContainerSupport, a JVM inside a 2GB container reads host RAM (say 64GB) and sets -Xmx ~12GB — causing the container to be OOM-killed by the kernel, not the JVM.",
+          "gotcha": "-XX:+ExitOnOutOfMemoryError is controversial — some teams prefer catching OOM and alerting rather than crashing. But in practice, an OOM-surviving JVM is often in a broken state (partially initialised objects, corrupted caches). Crash-and-restart is safer."
+        },
+        {
+          "id": "heap-tuning-sizing",
+          "topicId": "java-heap-space",
+          "subtopicId": "heap-tuning",
+          "title": "Right-Sizing the Heap: Live Set & GC Headroom",
+          "difficulty": "Mid",
+          "explanation": "The heap minimum for smooth GC is 3–4× the live data set (objects that survive a full GC). Below this, the JVM spends excessive time collecting. Above 4×, you waste memory without benefit. The live set is measured by performing a Full GC and reading the used heap afterwards. For G1, keep steady-state occupancy below 70%. For ZGC, keep below 50% to allow concurrent relocation.",
+          "codeExample": "// Measure live set size:\n// 1. Trigger Full GC (in dev/staging only):\njmap -histo:live <pid>   // forces Full GC, prints histogram\n\n// Or via JMX:\nManagementFactory.getMemoryMXBean().gc();\nlong liveBytes = ManagementFactory.getMemoryMXBean()\n    .getHeapMemoryUsage().getUsed();\n\n// 2. From GC log after Full GC line:\n// [gc] GC(100) Pause Full (Ergonomics) 800M->320M(1024M) 2.3s\n//                                        ↑ live set = 320MB\n\n// Sizing formula:\n// -Xmx = live_set × 4      for G1 / Parallel\n// -Xmx = live_set × 5      for ZGC (needs more headroom)\n\n// If live set = 320 MB:\n// G1 → -Xmx1280m (round to -Xmx1536m)\n// ZGC → -Xmx1600m (round to -Xmx2g)\n\n// Monitor live set drift over time with Prometheus jvm_memory_used_bytes",
+          "whyItMatters": "Oversizing the heap wastes container memory and increases Full GC pause duration when it does occur. Undersizing causes constant GC overhead. Right-sizing with a 3–4× live-set headroom is the single most impactful tuning decision.",
+          "gotcha": "Live set grows at application load — measure it under realistic peak traffic, not idle. A Spring Boot app may have a 200MB live set idle and 600MB under load. Size for peak."
+        },
+        {
+          "id": "heap-tuning-container",
+          "topicId": "java-heap-space",
+          "subtopicId": "heap-tuning",
+          "title": "JVM in Containers: cgroups, -XX:MaxRAMPercentage & Limits",
+          "difficulty": "Senior",
+          "explanation": "Before Java 8u191, the JVM read /proc/meminfo (host RAM) and ignored cgroup memory limits. A 512MB container on a 64GB host would see 64GB and set a ~12GB default max heap — causing Linux to OOM-kill the container. Java 8u191+ added -XX:+UseContainerSupport (on by default in Java 11+) which reads cgroup limits correctly. -XX:MaxRAMPercentage lets you express heap as a % of the container limit without hardcoding -Xmx.",
+          "codeExample": "# Wrong: hardcoded, breaks when container limit changes\n-Xmx512m\n\n# Right: percentage-based, portable\n-XX:MaxRAMPercentage=75.0\n# → for 1GB container limit: -Xmx768m auto-computed\n\n# Verify cgroup detection (Java 17+):\n# -Xlog:os+container=trace\n# Output: container memory limit: 1073741824 (1.00 GB)\n\n# Leave headroom for:\n# - Metaspace    (typically 100–300MB)\n# - Thread stacks (-Xss × thread count; 1MB × 200 threads = 200MB)\n# - Direct memory (NIO, netty; tune with -XX:MaxDirectMemorySize)\n# - JVM overhead  (~50MB)\n# Rule of thumb: heap = 50–70% of container memory limit\n\n# Check what heap limit the JVM computed:\njava -XX:+UseContainerSupport -XX:MaxRAMPercentage=75 \\\n     -XX:+PrintFlagsFinal -version 2>&1 | grep -E 'MaxHeapSize|InitialHeapSize'",
+          "whyItMatters": "Container OOM kills are silent and catastrophic in production — Kubernetes restarts the pod with no heap dump and no JVM GC log. This is one of the most common causes of mysterious pod restarts in Java microservices.",
+          "gotcha": "In Kubernetes, set both resources.requests.memory and resources.limits.memory to the same value (Guaranteed QoS). If limit > request, the node can over-commit — your pod gets OOM-killed even when the JVM is within its -Xmx, because another pod on the same node is consuming node memory."
+        }
+      ]
+    },
+    {
+      "id": "memory-leaks",
+      "title": "Memory Leaks & Heap Dump Analysis",
+      "cards": [
+        {
+          "id": "memory-leaks-patterns",
+          "topicId": "java-heap-space",
+          "subtopicId": "memory-leaks",
+          "title": "Common Java Memory Leak Patterns",
+          "difficulty": "Mid",
+          "explanation": "Java memory leaks occur when objects remain reachable (via strong references) longer than intended. Common patterns: (1) Static collections accumulating entries without eviction. (2) Listeners/callbacks registered but never deregistered. (3) ThreadLocal variables not removed after request processing. (4) Classloader leaks in app servers — a new deployment creates a new ClassLoader; if old classes are referenced from static fields, old ClassLoaders can't be GC'd, filling Metaspace. (5) Caches without size bounds or expiry.",
+          "codeExample": "// 1. Static collection leak:\nclass Registry {\n    private static final Map<String, Session> sessions = new HashMap<>();\n    // BAD: sessions never evicted\n    // FIX: use Guava Cache or Caffeine with expiry:\n    // Cache<String, Session> sessions = Caffeine.newBuilder()\n    //     .expireAfterAccess(30, MINUTES).maximumSize(10_000).build();\n}\n\n// 2. ThreadLocal leak (common in thread pools / Tomcat):\nclass RequestContext {\n    private static final ThreadLocal<User> current = new ThreadLocal<>();\n    public static void set(User u) { current.set(u); }\n    // FIX: always clear in finally:\n    //   try { set(user); handle(request); } finally { current.remove(); }\n}\n\n// 3. Listener leak:\nclass EventSource {\n    private final List<Listener> listeners = new ArrayList<>();\n    public void addListener(Listener l) { listeners.add(l); }\n    // FIX: also provide removeListener(), or use WeakReference<Listener>\n}\n\n// 4. Classloader leak — avoid storing Class<?> in static fields across deployments",
+          "whyItMatters": "Leaks manifest as a heap that grows continuously under constant load and never returns to baseline after GC. They turn a Monday 9am deployment into a Friday 3am OOM page. Long-running services (app servers, messaging consumers) are most vulnerable.",
+          "gotcha": "ThreadLocal leaks in thread-pool-based servers (Tomcat, Jetty) are especially dangerous — threads are reused, so stale ThreadLocal values carry over between requests, causing both memory leaks and data-corruption bugs (serving one user's data to another)."
+        },
+        {
+          "id": "memory-leaks-heap-dump",
+          "topicId": "java-heap-space",
+          "subtopicId": "memory-leaks",
+          "title": "Heap Dump Analysis with MAT & VisualVM",
+          "difficulty": "Senior",
+          "explanation": "A heap dump is a snapshot of all live objects in the heap at a point in time. Tools: Eclipse Memory Analyser (MAT) for OOM postmortem analysis and leak suspect reports; VisualVM for live monitoring and interactive heap sampling; jmap for triggering dumps from the command line; async-profiler for allocation profiling without heap dumps.",
+          "codeExample": "# Capture heap dump (live process):\njmap -dump:format=b,live,file=heap.hprof <pid>\n\n# Or trigger on OOM automatically:\n-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/tmp/\n\n# Or via jcmd (preferred in Java 11+):\njcmd <pid> GC.heap_dump /tmp/heap.hprof\n\n// MAT workflow:\n// 1. Open heap.hprof in Eclipse MAT\n// 2. Run \"Leak Suspects Report\" → finds top retained-heap culprits\n// 3. Inspect \"Dominator Tree\" → who is keeping what alive\n// 4. Use OQL to query: SELECT * FROM java.util.HashMap$Entry WHERE ...\n\n// VisualVM live workflow:\n// 1. Attach to running JVM\n// 2. Monitor tab → watch Heap Used over time\n// 3. If heap grows without returning to baseline after GC → leak\n// 4. Sampler → Memory → see allocation by class\n\n# async-profiler allocation profiling (no overhead of heap dump):\n./asprof -d 30 -e alloc -f alloc.html <pid>",
+          "whyItMatters": "Heap dump analysis is the definitive way to identify memory leaks. MAT's retained-heap view shows not just how much memory an object occupies, but how much would be freed if it were collected — pointing directly to the leak root.",
+          "gotcha": "Heap dumps of live processes pause all application threads for the duration of the dump (can be 10–60 seconds for a multi-GB heap). Always capture from a non-production instance or a replica taken out of the load balancer first."
+        },
+        {
+          "id": "memory-leaks-weak-references",
+          "topicId": "java-heap-space",
+          "subtopicId": "memory-leaks",
+          "title": "Weak, Soft & Phantom References",
+          "difficulty": "Senior",
+          "explanation": "Java has four reference strengths. Strong (normal) references prevent GC. Soft references are cleared before OOM — ideal for memory-sensitive caches. Weak references are cleared at the next GC regardless of memory pressure — used in WeakHashMap for associating metadata with objects whose lifetimes you don't control. Phantom references allow post-finalisation cleanup via ReferenceQueue — used by frameworks for resource cleanup (NIO DirectByteBuffer cleanup, for example).",
+          "codeExample": "// Soft reference cache (survives GC unless heap is low):\nSoftReference<BufferedImage> imageCache =\n    new SoftReference<>(loadExpensiveImage());\nBufferedImage img = imageCache.get(); // may return null after GC\nif (img == null) img = loadExpensiveImage(); // reload\n\n// Weak reference (for canonical maps, metadata association):\nWeakReference<Widget> ref = new WeakReference<>(widget);\n// widget can be GC'd; ref.get() returns null after collection\n\n// WeakHashMap — keys are weak references:\nMap<Object, Metadata> meta = new WeakHashMap<>();\n// Entry removed automatically when key is GC'd\n// WARNING: do not use when you want the map to keep the key alive\n\n// Phantom reference with ReferenceQueue (for cleanup):\nReferenceQueue<Resource> queue = new ReferenceQueue<>();\nPhantomReference<Resource> phantom = new PhantomReference<>(res, queue);\n// After res is GC'd, phantom is enqueued — poll queue to run cleanup\n\n// Java 9+ Cleaner (preferred over finalizers and PhantomRef directly):\nCleaner cleaner = Cleaner.create();\ncleaner.register(res, () -> closeNativeResource());",
+          "whyItMatters": "Understanding reference types lets you build memory-aware caches and avoid both leaks (strong refs to dead objects) and premature eviction (using WeakRef when SoftRef is appropriate). WeakHashMap is commonly misused — if the value holds the key, the key is never collected.",
+          "gotcha": "Finalize() is deprecated and dangerous — objects with finalize() methods survive at least one extra GC cycle, increasing promotion pressure. Use Cleaner or try-with-resources instead. Never rely on finalize() for correctness."
+        }
+      ]
+    }
+  ]
+}

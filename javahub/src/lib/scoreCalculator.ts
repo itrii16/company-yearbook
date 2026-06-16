@@ -6,6 +6,7 @@ export const TOPIC_GROUPS: Record<string, string> = {
   'jvm-internals': 'Java Core',
   'generics': 'Java Core',
   'javadoc': 'Java Core',
+  'java-heap-space': 'Java Core',
   'oop': 'Engineering Principles',
   'solid': 'Engineering Principles',
   'clean-code': 'Engineering Principles',
